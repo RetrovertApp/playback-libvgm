@@ -41,7 +41,7 @@ if(UNIX)
 endif()
 
 # Find zlib for VGZ decompression
-find_package(ZLIB REQUIRED)
+add_subdirectory(external/zlib)
 
 # libvgm emulation core sources (explicitly listed - many files are #included by others)
 set(LIBVGM_EMU_SOURCES
