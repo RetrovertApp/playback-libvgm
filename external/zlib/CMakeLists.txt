@@ -1,9 +1,13 @@
-# Minimal vendored zlib build (inflate/deflate only, no gzip file I/O)
+# Vendored zlib build (with gzip file I/O for libvgm)
 add_library(zlib_static STATIC
     adler32.c
     compress.c
     crc32.c
     deflate.c
+    gzclose.c
+    gzlib.c
+    gzread.c
+    gzwrite.c
     infback.c
     inffast.c
     inflate.c
