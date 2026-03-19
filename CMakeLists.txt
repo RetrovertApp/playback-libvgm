@@ -213,7 +213,7 @@ target_include_directories(libvgm_playback PRIVATE
 )
 
 target_link_libraries(libvgm_playback PRIVATE
-    ZLIB::ZLIB
+    zlib_full_static
 )
 
 target_link_libraries(libvgm_playback PRIVATE vgm_pattern)
