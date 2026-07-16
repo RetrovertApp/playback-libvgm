@@ -216,8 +216,11 @@ target_link_libraries(libvgm_playback PRIVATE
     zlib_full_static
 )
 
-target_link_libraries(libvgm_playback PRIVATE vgm_pattern)
-target_compile_definitions(libvgm_playback PRIVATE HAS_VGM_PATTERN)
+option(LIBVGM_VGM_PATTERN "Extract VGM register stream into pattern cells for visualization" ON)
+if(LIBVGM_VGM_PATTERN)
+    target_link_libraries(libvgm_playback PRIVATE vgm_pattern)
+    target_compile_definitions(libvgm_playback PRIVATE HAS_VGM_PATTERN)
+endif()
 
 if(NOT WIN32)
     target_link_libraries(libvgm_playback PRIVATE pthread m)

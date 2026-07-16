@@ -41,12 +41,6 @@ extern "C" {
 
 #define VGM_DEBUG_WRITES 0
 
-#if VGM_DEBUG_WRITES
-static int s_debug_cell_count = 0;
-static uint32_t s_last_logged_row = UINT32_MAX;
-static double s_last_logged_time = -1.0;
-#endif
-
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Module-local globals for API access
 
@@ -75,11 +69,8 @@ struct LibvgmData {
     // VGM pattern extraction
     VgmAllocator* pattern_alloc;
     VgmPattern* pattern;
-    uint32_t current_sample; // Tracks current playback position in samples
 #endif
-
-    // Scope visualization state
-    bool scope_enabled;
+    // ponytail: scope enable state lives in the player, not mirrored here.
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -328,7 +319,6 @@ static int libvgm_open(void* user_data, const char* url, uint32_t subsong, const
 #ifdef HAS_VGM_PATTERN
     // Extract VGM pattern data for visualization (VGM/VGZ files only)
     data->pattern = nullptr;
-    data->current_sample = 0;
     if (data->pattern_alloc != nullptr) {
         // Reset allocator for new file
         vgm_alloc_rewind(data->pattern_alloc);
@@ -444,7 +434,6 @@ static void libvgm_close(void* user_data) {
 #ifdef HAS_VGM_PATTERN
     // Clear pattern data (arena memory will be reused on next open)
     data->pattern = nullptr;
-    data->current_sample = 0;
 #endif
     data->vu_left = 0;
     data->vu_right = 0;
@@ -656,243 +645,261 @@ static void libvgm_event(void* user_data, uint8_t* event_data, uint64_t len) {
     }
 #endif
 
-    if (len < 8 || data == nullptr) {
+    if (len < 8 || event_data == nullptr || data == nullptr) {
         return;
     }
 
-    // Report VU meters based on recent peak amplitude
+    // Legacy VU side-channel; per-channel playheads now come from get_channel_rows.
+    memset(event_data, 0, 8);
     event_data[0] = data->vu_left;
     event_data[1] = data->vu_right;
-    event_data[2] = 0;
-    event_data[3] = 0;
-
-#ifdef HAS_VGM_PATTERN
-    // Report current row based on playback position
-    // Note: With per-channel scrolling, this legacy row value is only used for
-    // compatibility. The real per-channel positions are handled via get_tracker_info().
-    if (data->pattern != nullptr && data->player != nullptr && data->pattern->channel_count > 0) {
-        // Get current sample position from player (at 44100Hz VGM rate)
-        double current_time = data->player->GetCurTime(PLAYTIME_TIME_FILE);
-        uint32_t current_sample = static_cast<uint32_t>(current_time * 44100.0);
-
-        // Find first channel with events to get a representative row
-        uint32_t current_row = 0;
-        for (uint32_t ch = 0; ch < data->pattern->channel_count; ch++) {
-            if (data->pattern->channels[ch].row_count > 0) {
-                current_row = vgm_channel_find_row(&data->pattern->channels[ch], current_sample);
-                break;
-            }
-        }
-
-        // Store row as 16-bit little-endian in event_data[5:6]
-        event_data[5] = static_cast<uint8_t>((current_row >> 8) & 0xFF); // High byte
-        event_data[6] = static_cast<uint8_t>(current_row & 0xFF);        // Low byte
-        event_data[7] = 0;                                               // Pattern number (VGM only has one pattern)
-    } else
-#endif
-    {
-        event_data[5] = 0;
-        event_data[6] = 0;
-        event_data[7] = 0;
-    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Tracker visualization API
+// Visualization API (per-channel scrolling; the whole register stream is known at open)
 
-static int libvgm_get_tracker_info(void* user_data, RVTrackerInfo* info) {
-    LibvgmData* data = static_cast<LibvgmData*>(user_data);
-
-    if (data == nullptr || info == nullptr) {
-        return -1;
-    }
-
-    memset(info, 0, sizeof(RVTrackerInfo));
-
-    // Get song metadata from player tags
-    if (data->player != nullptr) {
-        PlayerBase* base_player = data->player->GetPlayer();
-        if (base_player != nullptr) {
-            const char* const* tags = base_player->GetTags();
-            if (tags != nullptr) {
-                const char* title = nullptr;
-                const char* game = nullptr;
-                const char* artist = nullptr;
-
-                // Parse tags (pairs of type, value)
-                for (int i = 0; tags[i] != nullptr; i += 2) {
-                    const char* tag_type = tags[i];
-                    const char* tag_value = tags[i + 1];
-                    if (tag_value == nullptr || tag_value[0] == '\0') {
-                        continue;
-                    }
-                    if (strcmp(tag_type, "TITLE") == 0) {
-                        title = tag_value;
-                    } else if (strcmp(tag_type, "GAME") == 0) {
-                        game = tag_value;
-                    } else if (strcmp(tag_type, "ARTIST") == 0) {
-                        artist = tag_value;
-                    }
-                }
-
-                // Populate metadata fields separately
-                if (title != nullptr && title[0] != '\0') {
-                    strncpy(info->song_name, title, sizeof(info->song_name) - 1);
-                    info->song_name[sizeof(info->song_name) - 1] = '\0';
-                }
-                if (game != nullptr && game[0] != '\0') {
-                    strncpy(info->game_name, game, sizeof(info->game_name) - 1);
-                    info->game_name[sizeof(info->game_name) - 1] = '\0';
-                }
-                if (artist != nullptr && artist[0] != '\0') {
-                    strncpy(info->artist_name, artist, sizeof(info->artist_name) - 1);
-                    info->artist_name[sizeof(info->artist_name) - 1] = '\0';
-                }
-            }
-        }
-    }
+#define LIBVGM_COLUMN_COUNT 4
 
 #ifdef HAS_VGM_PATTERN
-    if (data->pattern != nullptr) {
-        info->num_channels = static_cast<uint8_t>(data->pattern->channel_count);
-        info->num_patterns = 1;          // VGM has one "pattern" (the entire file)
-        info->channels_synchronized = 0; // Per-channel scrolling - channels NOT synchronized
 
-        // Pass native pattern data for direct VGM rendering
-        info->native_pattern_data = data->pattern;
-
-        // Report current playback position in samples
-        if (data->player != nullptr) {
-            double current_time = data->player->GetCurTime(PLAYTIME_TIME_FILE);
-            info->current_sample = static_cast<uint32_t>(current_time * 44100.0);
-        }
-
-        // Copy channel names and per-channel info
-        for (uint32_t i = 0; i < data->pattern->channel_count && i < RV_MAX_CHANNELS; i++) {
-            if (data->pattern->channel_info != nullptr) {
-                strncpy(info->channels[i].name, data->pattern->channel_info[i].name,
-                        sizeof(info->channels[i].name) - 1);
-            }
-            // Per-channel row count and current row position
-            if (data->pattern->channels != nullptr) {
-                info->channels[i].num_rows = data->pattern->channels[i].row_count;
-                // Calculate current row for this channel based on sample position
-                info->channels[i].current_row = vgm_channel_find_row(&data->pattern->channels[i], info->current_sample);
-            }
-        }
-
-        // Set main current_row using first channel with data (for compatibility with simple displays)
-        // Also find max row count across all channels for rows_per_pattern
-        uint32_t max_rows = 64;
-        for (uint32_t i = 0; i < data->pattern->channel_count && i < RV_MAX_CHANNELS; i++) {
-            if (data->pattern->channels != nullptr && data->pattern->channels[i].row_count > 0) {
-                if (info->current_row == 0) {
-                    info->current_row = static_cast<uint16_t>(info->channels[i].current_row);
-                }
-                if (data->pattern->channels[i].row_count > max_rows) {
-                    max_rows = data->pattern->channels[i].row_count;
-                }
-            }
-        }
-        info->rows_per_pattern = static_cast<uint16_t>(max_rows > 65535 ? 65535 : max_rows);
-
-        return 0;
+static void libvgm_set_cell(RVPatternCell* cell, uint32_t raw, const char* text) {
+    cell->raw = raw;
+    memset(cell->text, 0, sizeof(cell->text));
+    if (text != nullptr) {
+        strncpy((char*)cell->text, text, sizeof(cell->text) - 1);
     }
-#endif
-
-    return -1; // No pattern data available
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+static void libvgm_note_name(uint8_t midi, char* out, size_t out_size) {
+    static const char* names[12] = { "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-" };
+    snprintf(out, out_size, "%s%d", names[midi % 12], (int)midi / 12 - 1); // MIDI 60 = C-4
+}
 
-static int libvgm_get_pattern_cell(void* user_data, int pattern, int row, int channel, RVPatternCell* cell) {
-    (void)pattern; // VGM only has one "pattern"
-    (void)row;
-    (void)channel;
+// Render LIBVGM_COLUMN_COUNT cells (Note, Vol, Eff, Prm) for one (channel, row). Each cell's
+// `raw` carries the numeric value and `text` the rendered string, so the effect encoding is
+// standardized at the boundary: the volume command lives in `raw` as VGM_EFFECT_VOLUME, the
+// letter 'V' only in `text`.
+static void libvgm_fill_row(const VgmChannelPattern* chp, uint32_t row, RVPatternCell* out) {
+    for (int c = 0; c < LIBVGM_COLUMN_COUNT; c++) {
+        libvgm_set_cell(&out[c], 0, "..");
+    }
+    if (chp == nullptr || row >= chp->row_count) {
+        return;
+    }
+    const VgmPatternCell* cell = &chp->rows[row].cell;
+    char buf[8];
+
+    if (cell->has_note) {
+        if (cell->type == VGM_NOTE_OFF) {
+            libvgm_set_cell(&out[0], 0xFF, "==="); // note-off: standardized raw 0xFF
+        } else {
+            libvgm_note_name(cell->note, buf, sizeof(buf));
+            libvgm_set_cell(&out[0], cell->note, buf);
+            if (cell->velocity != 0) {
+                snprintf(buf, sizeof(buf), "%02X", cell->velocity);
+                libvgm_set_cell(&out[1], cell->velocity, buf);
+            }
+        }
+    }
+
+    if (cell->has_effect && cell->effect_type == VGM_EFFECT_VOLUME) {
+        libvgm_set_cell(&out[2], VGM_EFFECT_VOLUME, "V");
+        snprintf(buf, sizeof(buf), "%02X", cell->effect_value);
+        libvgm_set_cell(&out[3], cell->effect_value, buf);
+    }
+}
+
+#endif // HAS_VGM_PATTERN
+
+static bool libvgm_get_structure(void* user_data, RVVizInfo* out) {
     LibvgmData* data = static_cast<LibvgmData*>(user_data);
-
-    if (data == nullptr || cell == nullptr) {
-        return -1;
+    if (data == nullptr || out == nullptr) {
+        return false;
     }
-
-    memset(cell, 0, sizeof(RVPatternCell));
-
+    uint32_t caps = 0;
+    out->scroll_mode = RVScrollMode_PerChannel;
+    out->pattern_channel_count = 0;
+    out->column_count = 0;
 #ifdef HAS_VGM_PATTERN
-    if (data->pattern == nullptr) {
-        return -1;
+    if (data->pattern != nullptr && data->pattern->channel_count > 0) {
+        // The whole VGM register stream is parsed at open, so every row is known up front.
+        caps |= RVVizCaps_PatternCells | RVVizCaps_WholeSongKnown;
+        out->pattern_channel_count = data->pattern->channel_count;
+        out->column_count = LIBVGM_COLUMN_COUNT;
     }
-
-    if (channel < 0 || static_cast<uint32_t>(channel) >= data->pattern->channel_count) {
-        return -1;
+#endif
+    uint32_t scope_channels = data->player != nullptr ? data->player->GetScopeChannelCount() : 0;
+    if (scope_channels > 0) {
+        caps |= RVVizCaps_Scope;
     }
+    out->caps = caps;
+    out->scope_channel_count = scope_channels;
+    return caps != 0;
+}
 
-    // Get the per-channel pattern
-    const VgmChannelPattern* ch_pattern = &data->pattern->channels[channel];
-    if (row < 0 || static_cast<uint32_t>(row) >= ch_pattern->row_count) {
-        return -1;
+static uint32_t libvgm_get_columns(void* user_data, RVColumnDesc* out, uint32_t cap) {
+    (void)user_data;
+#ifdef HAS_VGM_PATTERN
+    static const struct {
+        const char* label;
+        uint8_t width;
+        RVColumnKind kind;
+    } cols[LIBVGM_COLUMN_COUNT] = {
+        { "Note", 3, RVColumnKind_Note }, { "Vol", 2, RVColumnKind_Volume },
+        { "Eff", 1, RVColumnKind_Effect }, { "Prm", 2, RVColumnKind_Param },
+    };
+    uint32_t n = cap < LIBVGM_COLUMN_COUNT ? cap : LIBVGM_COLUMN_COUNT;
+    for (uint32_t i = 0; i < n; i++) {
+        memset(out[i].label, 0, sizeof(out[i].label));
+        strncpy((char*)out[i].label, cols[i].label, sizeof(out[i].label) - 1);
+        out[i].char_width = cols[i].width;
+        out[i].kind = cols[i].kind;
     }
-
-    const VgmPatternCell* vgm_cell = &ch_pattern->rows[row].cell;
-
-    if (vgm_cell->has_note) {
-        if (vgm_cell->type == VGM_NOTE_ON || vgm_cell->type == VGM_NOTE_CHANGE) {
-            // Convert MIDI note to tracker note format (1 = C-0, etc.)
-            // MIDI note 60 = C-4, tracker note 1 = C-0
-            // So: tracker_note = midi_note - 60 + 48 + 1 = midi_note - 11
-            // But clamp to valid range 1-96
-            int tracker_note = vgm_cell->note - 11;
-            if (tracker_note < 1)
-                tracker_note = 1;
-            if (tracker_note > 96)
-                tracker_note = 96;
-            cell->note = static_cast<uint8_t>(tracker_note);
-            cell->volume = vgm_cell->velocity;
-        } else if (vgm_cell->type == VGM_NOTE_OFF) {
-            // Note-off: use special value (depends on format, often 97 or 0xFF)
-            cell->note = 97; // Common "note off" value
-        }
-    }
-
-    // Copy effect data if present
-    if (vgm_cell->has_effect) {
-        // Map VGM effect types to tracker effect commands
-        // Using 'V' (0x16) for volume effect, similar to MOD/XM format
-        if (vgm_cell->effect_type == VGM_EFFECT_VOLUME) {
-            cell->effect = 'V'; // Volume effect command
-            cell->effect_param = vgm_cell->effect_value;
-        }
-    }
-
-    return 0;
+    return n;
 #else
-    return -1;
+    (void)out;
+    (void)cap;
+    return 0;
 #endif
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static int libvgm_get_pattern_num_rows(void* user_data, int pattern) {
-    (void)pattern; // VGM only has one "pattern"
-    LibvgmData* data = static_cast<LibvgmData*>(user_data);
-
-    if (data == nullptr) {
-        return 0;
-    }
-
+static uint32_t libvgm_get_pattern_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
 #ifdef HAS_VGM_PATTERN
-    if (data->pattern == nullptr) {
+    LibvgmData* data = static_cast<LibvgmData*>(user_data);
+    if (data == nullptr || data->pattern == nullptr) {
         return 0;
     }
+    uint32_t count = data->pattern->channel_count;
+    if (count > cap) {
+        count = cap;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        memset(out[i].name, 0, sizeof(out[i].name));
+        const char* name = data->pattern->channel_info != nullptr ? data->pattern->channel_info[i].name : nullptr;
+        if (name != nullptr) {
+            strncpy((char*)out[i].name, name, sizeof(out[i].name) - 1);
+        } else {
+            snprintf((char*)out[i].name, sizeof(out[i].name), "Ch %u", i + 1);
+        }
+        out[i].scope_width = 0;
+    }
+    return count;
+#else
+    (void)user_data;
+    (void)out;
+    (void)cap;
+    return 0;
+#endif
+}
 
-    // For per-channel patterns, return the max row count among all channels
+static uint32_t libvgm_get_scope_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
+    LibvgmData* data = static_cast<LibvgmData*>(user_data);
+    if (data == nullptr || data->player == nullptr) {
+        return 0;
+    }
+    uint32_t count = data->player->GetScopeChannelCount();
+    if (count > cap) {
+        count = cap;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        memset(out[i].name, 0, sizeof(out[i].name));
+        const char* name = data->player->GetScopeChannelName(static_cast<uint8_t>(i));
+        if (name != nullptr) {
+            strncpy((char*)out[i].name, name, sizeof(out[i].name) - 1);
+        }
+        out[i].scope_width = 1; // mono per voice
+    }
+    return count;
+}
+
+static bool libvgm_get_position(void* user_data, RVTrackerPosition* out) {
+#ifdef HAS_VGM_PATTERN
+    LibvgmData* data = static_cast<LibvgmData*>(user_data);
+    if (data == nullptr || data->pattern == nullptr || out == nullptr) {
+        return false;
+    }
     uint32_t max_rows = 0;
     for (uint32_t ch = 0; ch < data->pattern->channel_count; ch++) {
         if (data->pattern->channels[ch].row_count > max_rows) {
             max_rows = data->pattern->channels[ch].row_count;
         }
     }
-    return static_cast<int>(max_rows);
+    out->order = 0;
+    out->pattern = 0;
+    out->row = 0;
+    out->window_lo = 0;
+    out->window_hi = max_rows; // whole song; per-channel playheads come from get_channel_rows
+    return max_rows > 0;
 #else
+    (void)user_data;
+    (void)out;
+    return false;
+#endif
+}
+
+static uint32_t libvgm_get_channel_rows(void* user_data, uint32_t* out, uint32_t cap) {
+#ifdef HAS_VGM_PATTERN
+    LibvgmData* data = static_cast<LibvgmData*>(user_data);
+    if (data == nullptr || data->pattern == nullptr || out == nullptr || data->player == nullptr) {
+        return 0;
+    }
+    // The quantizer indexes rows by VGM sample position (44100 Hz file clock).
+    uint32_t sample = static_cast<uint32_t>(data->player->GetCurTime(PLAYTIME_TIME_FILE) * 44100.0);
+    uint32_t count = data->pattern->channel_count;
+    if (count > cap) {
+        count = cap;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        out[i] = vgm_channel_find_row(&data->pattern->channels[i], sample);
+    }
+    return count;
+#else
+    (void)user_data;
+    (void)out;
+    (void)cap;
+    return 0;
+#endif
+}
+
+static uint32_t libvgm_get_cells(void* user_data, int32_t channel, uint32_t row_lo, uint32_t row_hi, RVPatternCell* out,
+                                 uint32_t cap) {
+#ifdef HAS_VGM_PATTERN
+    LibvgmData* data = static_cast<LibvgmData*>(user_data);
+    if (data == nullptr || data->pattern == nullptr || out == nullptr) {
+        return 0;
+    }
+    int num_channels = static_cast<int>(data->pattern->channel_count);
+    if (num_channels <= 0) {
+        return 0;
+    }
+    int ch_start = channel < 0 ? 0 : channel;
+    int ch_end = channel < 0 ? num_channels : channel + 1;
+    if (ch_start >= num_channels) {
+        return 0;
+    }
+    if (ch_end > num_channels) {
+        ch_end = num_channels;
+    }
+    // Rectangular row-major grid (row -> channel -> column). Rows past a short channel's end
+    // yield empty cells so the host can index a fixed stride across channels.
+    uint32_t written = 0;
+    for (uint32_t row = row_lo; row < row_hi; row++) {
+        for (int ch = ch_start; ch < ch_end; ch++) {
+            if (written + LIBVGM_COLUMN_COUNT > cap) {
+                return written;
+            }
+            libvgm_fill_row(&data->pattern->channels[ch], row, &out[written]);
+            written += LIBVGM_COLUMN_COUNT;
+        }
+    }
+    return written;
+#else
+    (void)user_data;
+    (void)channel;
+    (void)row_lo;
+    (void)row_hi;
+    (void)out;
+    (void)cap;
     return 0;
 #endif
 }
@@ -906,42 +913,32 @@ static void libvgm_static_init(const RVService* service_api) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Scope visualization - uses real per-channel audio from chip emulators
+// Scope visualization - real per-channel audio from chip emulators
 
-static uint32_t libvgm_get_scope_data(void* user_data, int channel, float* buffer, uint32_t num_samples) {
+static void libvgm_set_scope_enabled(void* user_data, bool on) {
     LibvgmData* data = static_cast<LibvgmData*>(user_data);
-    if (data == nullptr || buffer == nullptr || data->player == nullptr) {
-        return 0;
+    if (data == nullptr || data->player == nullptr) {
+        return;
     }
-
-    if (channel < 0) {
-        return 0;
-    }
-
-    // Auto-enable scope capture on first call
-    if (!data->scope_enabled) {
-        data->player->SetScopeEnabled(true);
-        data->scope_enabled = true;
-    }
-
-    // Get scope data from player (which forwards to chip emulators)
-    return data->player->GetScopeData(static_cast<uint8_t>(channel), buffer, num_samples);
+    data->player->SetScopeEnabled(on);
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static uint32_t libvgm_get_scope_channel_names(void* user_data, const char** names, uint32_t max_channels) {
+static uint32_t libvgm_get_scope_samples(void* user_data, int32_t channel, float* out, uint32_t cap) {
     LibvgmData* data = static_cast<LibvgmData*>(user_data);
-    if (data == nullptr || data->player == nullptr)
+    if (data == nullptr || out == nullptr || data->player == nullptr || channel < 0) {
         return 0;
-
-    uint32_t count = data->player->GetScopeChannelCount();
-    if (count > max_channels)
-        count = max_channels;
-    for (uint32_t i = 0; i < count; i++) {
-        names[i] = data->player->GetScopeChannelName(static_cast<uint8_t>(i));
     }
-    return count;
+    // Capture is gated by set_scope_enabled; the player yields silence until then.
+    return data->player->GetScopeData(static_cast<uint8_t>(channel), out, cap);
+}
+
+// VU is reported through the legacy event side-channel (vu_left/vu_right); no value-semantic
+// VU surface is wired here yet, so this slot reports none (matches the other migrated plugins).
+static uint32_t libvgm_get_vu(void* user_data, float* out, uint32_t cap) {
+    (void)user_data;
+    (void)out;
+    (void)cap;
+    return 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -963,16 +960,17 @@ static RVPlaybackPlugin g_libvgm_plugin = {
     libvgm_metadata,
     libvgm_static_init,
     nullptr, // settings_updated
-
-    // Tracker visualization API - VGM pattern extraction
-    libvgm_get_tracker_info,
-    libvgm_get_pattern_cell,
-    libvgm_get_pattern_num_rows,
-
-    // Scope visualization API - real per-channel audio from chip emulators
-    libvgm_get_scope_data,
     nullptr, // static_destroy
-    libvgm_get_scope_channel_names,
+    libvgm_get_structure,
+    libvgm_get_columns,
+    libvgm_get_pattern_channels,
+    libvgm_get_scope_channels,
+    libvgm_get_position,
+    libvgm_get_channel_rows,
+    libvgm_get_cells,
+    libvgm_set_scope_enabled,
+    libvgm_get_scope_samples,
+    libvgm_get_vu,
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
