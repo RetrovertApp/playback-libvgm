@@ -180,7 +180,6 @@ set(LIBVGM_PLAYER_SOURCES
 set(LIBVGM_UTILS_SOURCES
     libvgm_src/utils/DataLoader.c
     libvgm_src/utils/MemoryLoader.c
-    libvgm_src/utils/FileLoader.c
 )
 
 # Platform-specific utils
