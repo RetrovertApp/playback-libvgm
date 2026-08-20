@@ -1,0 +1,9 @@
+[plugin]
+name = "libvgm"
+
+[data]
+entries = []
+
+[[fixtures]]
+file = "fixtures/test.vgz"
+sha256 = "98161e274d4ac92d972d9005cbdb9dbe9b36afe2f71cefb4dff2aa8acb56768e"

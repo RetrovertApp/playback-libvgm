@@ -460,7 +460,8 @@ static RVReadInfo libvgm_read_data(void* user_data, RVReadData dest) {
     }
 
     float* output = static_cast<float*>(dest.channels_output);
-    uint32_t max_frames = dest.channels_output_max_bytes_size / (sizeof(float) * 2);
+    uint32_t capacity_frames = dest.channels_output_max_bytes_size / (sizeof(float) * 2);
+    uint32_t max_frames = dest.info.frame_count < capacity_frames ? dest.info.frame_count : capacity_frames;
 
     // Allocate temporary buffer for WAVE_32BS output
     WAVE_32BS* temp_buffer = static_cast<WAVE_32BS*>(malloc(max_frames * sizeof(WAVE_32BS)));
